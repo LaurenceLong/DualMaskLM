@@ -28,12 +28,9 @@ class DualMaskLanguageModel(PreTrainedModel):
 
         # 2. 位置嵌入层 (Positional Embeddings)
         # LLaMA使用旋转位置嵌入 (RoPE)，这通常在注意力机制内部实现。
-        # 如果你的YourLlamaLayer实现了RoPE，则可能不需要这个独立的`position_embeddings`层。
         # 如果你的LLaMA组件期望外部提供相加的绝对位置编码，则保留此层。
         # 为简化，这里保留类似原始代码的显式可学习位置编码。
         # 你需要根据你的LLaMA组件实现来调整这部分。
-        self.position_embeddings = nn.Parameter(torch.zeros(1, config.max_position_embeddings, config.hidden_size))
-        # nn.init.normal_(self.position_embeddings, std=config.initializer_range) # 可以考虑初始化
 
         # 3. Decoder-1: Mask-Picker (使用LlamaDecoder结构)
         # 此Decoder用于选择哪些token被保留（构成骨架）
@@ -82,31 +79,6 @@ class DualMaskLanguageModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
-        # 你可能需要为你的 YourLlamaLayer 中的特定层（如RMSNorm）添加自定义初始化
-        # 例如:
-        # elif isinstance(module, YourRMSNorm):
-        #     module.weight.data.fill_(1.0)
-
-
-    def _apply_positional_embeddings(self, token_embeddings: torch.Tensor) -> torch.Tensor:
-        """
-        将位置编码添加到token编码。
-        如果你的LLaMA组件内部处理RoPE，则此函数可能不需要或有不同实现。
-        """
-        seq_length = token_embeddings.size(1)
-        if seq_length > self.config.max_position_embeddings:
-            # 可以截断或报错，取决于策略
-            pos_embeds_to_add = self.position_embeddings[:, :self.config.max_position_embeddings, :]
-            # 如果序列更长，可能需要扩展位置编码或用其他方式处理
-            logger.warning(f"序列长度 {seq_length} 超出最大位置编码 {self.config.max_position_embeddings}。位置编码将被截断/复用。")
-            # 简单的截断/复用策略 (如果允许序列比max_pos_emb长)
-            # 这里假设输入序列长度不会超过max_position_embeddings，如果会，需要更复杂的处理
-            token_embeddings = token_embeddings[:, :self.config.max_position_embeddings, :]
-        else:
-            pos_embeds_to_add = self.position_embeddings[:, :seq_length, :]
-        
-        return token_embeddings + pos_embeds_to_add
-
 
     def forward(
         self,
@@ -136,9 +108,7 @@ class DualMaskLanguageModel(PreTrainedModel):
 
         # --- 2. 获取输入嵌入 ---
         # (B, L, H)
-        initial_embeddings = self.word_embeddings(input_ids)
-        # (B, L, H) - 添加位置编码 (如果LLaMA组件不自带RoPE)
-        input_embeddings = self._apply_positional_embeddings(initial_embeddings)
+        input_embeddings = self.word_embeddings(input_ids)
 
         # --- 3. Decoder-1: Mask Picker ---
         # 输入是原始序列的嵌入，输出是每个token被保留的logits
@@ -213,8 +183,7 @@ class DualMaskLanguageModel(PreTrainedModel):
                 skeleton_attention_mask[b_idx, :length] = 1
         
         # 获取骨架的嵌入
-        skeleton_word_embeddings = self.word_embeddings(padded_skeleton_ids) # (B, max_skel_L, H)
-        skeleton_embeddings = self._apply_positional_embeddings(skeleton_word_embeddings) # (B, max_skel_L, H)
+        skeleton_embeddings = self.word_embeddings(padded_skeleton_ids) # (B, max_skel_L, H)
 
 
         # --- 5. Decoder-2: Pointer-Inserter ---
@@ -327,8 +296,7 @@ class DualMaskLanguageModel(PreTrainedModel):
 
         # --- 7. MLM Encoder 前向传播 ---
         # a. 获取损坏输入的嵌入
-        corrupted_word_embeddings = self.word_embeddings(corrupted_batch_input_ids) # (B, L, H)
-        corrupted_input_embeddings = self._apply_positional_embeddings(corrupted_word_embeddings) # (B, L, H)
+        corrupted_input_embeddings = self.word_embeddings(corrupted_batch_input_ids) # (B, L, H)
 
         # b. 通过MLM Encoder获取logits
         # LlamaEncoder的forward应返回一个包含"logits"键的字典

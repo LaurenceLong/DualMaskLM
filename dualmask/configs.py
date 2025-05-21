@@ -15,6 +15,7 @@ class DualMaskModelConfig(PretrainedConfig):
     intermediate_size: int = field(default_factory=lambda: 768 * 4) # LLaMA中通常是 (2/3 * 4 * H) * 2 / 2 = 1.33 * 4 * H, 调整这里
     num_hidden_layers_decoder: int = 6  # 用于 dec1 (mask_picker) 和 dec2 (pointer_inserter)
     num_hidden_layers_encoder: int = 6  # 用于主 MLM encoder
+    num_hidden_layers_default: int = 6  # 默认的decoder/encoder层数
     num_attention_heads: int = 12
     max_position_embeddings: int = 256  # 最大序列长度
     dropout_prob: float = 0.1           # Transformer层中的dropout概率

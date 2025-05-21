@@ -16,7 +16,7 @@ EXCLUDE_DIRS = {
     'dist',
     'checkpoints',
     'data',
-    'tok',
+    'outputs_dualmask_llama',
     # 添加其他你想要排除的目录
 }
 
