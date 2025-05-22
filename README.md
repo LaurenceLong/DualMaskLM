@@ -1,128 +1,126 @@
-# 全掩码双 Decoder 方案  
-
-> • Decoder-1：**Mask Picker**  
->   - 输入完整序列 x  
->   - 输出二值掩码 m¹，删去冗余 token → skeleton s = x ⊘ m¹  
->   - 目标：保留最能解释全句含义的“因”  
->   
-> • Decoder-2：**Mask Inserter**  
->   - 输入 skeleton s  
->   - 在恰当位置插入 k 个 `[MASK]` → sequence Ŝ  
->   - 目标：给并行补全器充分的“问号”，由“因”推到“果”  
->   
-> • Encoder + MLM head：一次性填充 Ŝ 中所有 `[MASK]` → x̂  
->   - 目标：x̂ ≈ 原句 x  
-
-下面给出一套端到端可训练的完整流程，使  
-1. Decoder-1 真正学会“删繁就简、因果归因”；  
-2. Decoder-2 学会“根据因补果”；  
-3. Encoder-MLM 负责细粒度 token 预测。  
+以下用统一的符号把你补充的「多轮循环」版本写清楚，并给出可微实现、门控、以及 **Edit / Generation** 两条 Path 的自动切换办法。
 
 ---
 
-## 1. 训练管线（单轮）
+## 1. 记号
 
-```
-x            // 原始句
-│
-├─► (A) Decoder-1 : Mask-Picker
-│      得到掩码 m¹   (可微采样)
-│      skeleton s = Drop(x, m¹)     // 仅保留未被掩码的 token
-│
-├─► (B) Decoder-2 : Mask-Inserter
-│      输出指针序列 p (长度 = k = |m¹| )      // 待插入位置
-│      Ŝ = InsertMask(s, p)
-│
-├─► (C) Encoder + MLM
-│      Ŝ ➜ x̂
-│
-└─► (D) 损失
-       L_recon = CE(x̂ , x)                     // 重建
-       L_comp  = α · |1 - retention|            // 压缩/保留率
-       L_ptr   = β · |k - |m¹||                 // 覆盖一致
-       总损失  L = L_recon + L_comp + L_ptr
-```
-
-### 1.1 可微离散操作  
-* **Mask 选择 (Decoder-1)**  
-  - 输出 per-token 概率 pᵢ，使用 Gumbel-Sigmoid 或 Straight-Through Bernoulli 采样 mᵢ∈{0,1}。  
-* **Mask 插入 (Decoder-2)**  
-  - 看作 Pointer Network：对 **s** 的片段间隙输出分布 qⱼ，  
-    用 Gumbel-Softmax 采样插入索引，或者用 policy gradient。  
-  - 插入数 k 固定为 |m¹|，用 L_ptr 约束。  
-
-### 1.2 压缩正则 (信息瓶颈)  
-```
-L_comp = λ · max(0, r_keep - r_target)      // r_keep = mean(1-m¹)
-```
-促使 Decoder-1 尽量少保留；`r_target` 可从 5-20 % 逐渐退火。
+* `X₀`        ：原始序列  
+* `L`         ：最多循环轮数（训练时可设 3–6，推理时可早停）  
+* `D₁`        ：Mask-Picker（删除）  
+* `D₂`        ：Mask-Inserter（并行插位）  
+* `E`         ：Encoder （预测`[MASK]`位置的logits）  
+* `H`         ：MLM head（多轮填充）  
+* `Gate`    ：标量门控 g∈[0,1]，控制本轮是否调用 D₁  
+  g≈1 → **编辑**（先删后补），g≈0 → **生成**（直接补）
 
 ---
 
-## 2. 分阶段训练策略  
+## 2. 训练流程（展开 L 轮，端到端反传）
 
-1. **Stage-0：预训练 Encoder-MLM**  
-   * 常规随机 span corruption (T5/BERT) → 得到稳健的填充器。  
-2. **Stage-1：只训 Decoder-2**  
-   * 用人工 skeleton：随机删除 r_token% token；  
-   * 训练它插回 `[MASK]`，让 Encoder-MLM 完全恢复。  
-   * 此时 Decoder-2 拥有“因→果”能力。  
-3. **Stage-2：端到端训 Decoder-1 + Decoder-2（MLM 冻结或低 lr）**  
-   * 损失=上节 L；  
-   * Decoder-1 学会掩去冗余，同时逼迫 Decoder-2 + MLM 仍然能重建。  
-4. **Stage-3：微调三模块**  
-   * 小学习率联合优化，提高极限质量。  
+```text
+X_0 = 原句或随机起始序列
+for l = 0 .. L-1:
 
-逐阶段可显著降低梯度方差，训练稳定。
+    g_l = Gate(E_l) if l > 0 else 0  # 判定本轮是否“编辑”，第一轮强制走生成分支
+    
+    # ---------- 删除阶段 ----------
+    if g_l > τ_edit:                 # τ_edit≈0.5，可软硬两用
+        p = D₁(X_l)                  # token 保留概率
+        m = Bernoulli_ST(p)          # Straight-Through 采样 0/1
+        S_l = Drop(X_l, m)           # skeleton = 留下来的 token
+    else:                            # 跳过编辑
+        S_l = X_l
+
+    # ---------- 插空阶段 ----------
+    q = D₂(S_l)                      # 对 S_l 的 gap 概率
+    idx = Pointer_ST(q, k=‖X_l‖-‖S_l‖)  # 可微指针采样
+    Ŝ_l = InsertMask(S_l, idx)       # 带 [MASK] 的序列
+
+    # ---------- 填充阶段 ----------
+    E_l = E(Ŝ_l)                 # 预测logits
+    X_{l+1} = H(E_l)             # 多轮填充
+endfor
+```
+
+### 损失
+
+```
+L_recon  = CE(X_L , X_target)            // 最后一步与目标对齐
+L_comp   = KL(p  ‖ Ber(r_target(g_l)))   // 控制删除量
+L_ptr    = KL(q  ‖ Uniform_gap)          // 避免扎堆插位
+L_gate   = c · g_l                       // “编辑”有代价
+总损失   = L_recon + λ₁L_comp + λ₂L_ptr + λ₃L_gate
+```
+
+* `r_target(g)=g·r_max`，使 Gate 决定每轮保留率  
+* `L_gate` 让模型在**编辑少但能重建**时倾向走生成分支
+
+梯度可通过 Straight-Through trick 跨越多轮反向传播；内存不足时可用 **truncated BPTT** 或 REINFORCE。
 
 ---
 
-## 3. 推理流程  
+## 3. 推理
 
-### 3.1 文本编辑  
-```
-prompt ─► Decoder-1 (可调 r_target)  
-      skeleton ─► Decoder-2 ─► Ŝ ─► Encoder-MLM → edited_text
-```
-- 若用户希望“保留主体、润色细节”，调低 r_target (少删)；  
-- 若希望“提炼摘要”，直接输出 skeleton。  
+### 3.1 Edit（用户已有文本）
 
-### 3.2 非自回归生成  
+```text
+X_0 = 用户 prompt
+for l=0..L-1:
+    g_l = Gate(X_l)          # 若想纯编辑，可手动设 g_l=1
+    ... 同上 ...
+    if StopCriterion(X_{l+1}, X_l): break   # 置信度↑或变化↓
+return X_{l+1}
 ```
-seed (<BOS>)  
-repeat T times:            // T≈4-6
-    seed ─► Decoder-2 ─► Ŝ ─► Encoder-MLM → new_seq
-    seed ← new_seq
+
+### 3.2 Generation（从空或短 prompt 续写）
+
+```text
+X_0 = prompt  (可为空，仅 <BOS>)
+for l=0..L-1:
+    g_l = 0                  # 强制走生成分支
+    S_l = X_l
+    q = D₂(S_l) ; Ŝ_l=...
+    X_{l+1} = E(Ŝ_l)
+    if StopCriterion(...): break
+return X_{l+1}
 ```
-可选每一轮后执行 Decoder-1“再压缩”一次形成循环推理。  
-整体路径=O(T) Encoder 前向，比自回归 O(n) latency 低。
+
+用户只需告诉模型“edit / generate / auto”。  
+* `edit`  ⇒ g_l=1  
+* `generate` ⇒ g_l=0  
+* `auto` ⇒ 由 Gate 网络自己输出 g_l。
 
 ---
 
-## 4. 优缺点总结  
+## 4. 关键实现要点
 
-优点  
-1. 纯 **掩码级** 操作，所有 token 生成都并行完成。  
-2. Decoder-1/2 角色清晰：  
-   * D1 = 提炼因（弃冗余）  
-   * D2 = 根据因补果（提问位置）  
-3. 可控性强：一句话通过 r_target 调摘要 vs 复原。  
-4. 与 MaskGIT、UL2 等现有并行生成技术兼容（Encoder-MLM 直接复用）。  
+1. **Gate 训练**  
+   无监督即可：`L_gate = c·g` 把“调用 D₁”视作要付费的动作。  
+   * 若删除对 `L_recon` 贡献不大，模型就学会把 g 压低→生成。  
+   * 若必须靠原文帮忙，g 会被拉高→编辑。  
+   之后可用 RL 微调 Gate 以优化人工指标（ROUGE、BLEU、人工评分）。
 
-风险 / 挑战  
-1. 双重离散决策（选 mask + 插 mask）→ 训练方差大；直通估计器或 REINFORCE 需仔细调超参。  
-2. 需额外 Pointer 级别位置编码，处理插空后位置偏移。  
-3. 当 skeleton 过于稀疏时，Decoder-2 可能找不到可插点，导致重建失败；需 L_ptr 做强约束。  
-4. 参数规模≈ (Decoder-1 + Decoder-2 + Encoder)；部署成本高于单 GPT 或单 BERT。  
+2. **梯度稳定**  
+   * Gumbel-Sigmoid / Gumbel-Softmax + Straight-Through  
+   * 可先 **冻结 E**，只训 D₂，再端到端 joint。  
+   * 对多轮循环，可先训练 1 轮，逐步放开到 L 轮（curriculum）。
+
+3. **早停 StopCriterion**  
+   * MaskGIT 式置信度平均值 > τ  
+   * 或两轮输出差异 < ε（Levenshtein Transformer 的做法）  
+   这样生成任务不会白跑 edit 分支，编辑任务不会过度迭代。
+
+4. **位置漂移处理**  
+   插空后 token index 变化：对 S_l 使用 **相对偏移位置编码**  
+   `pos'(i) = pos_orig(i) + #MASK_inserted_left(i)`  
+   保证 D₂ 在多轮中仍能准确定位 gap。
 
 ---
 
-## 5. 可行性结论  
+## 5. 小结
 
-• 只要选用可微采样技巧并采用“预训练-冻结-微调”分阶段策略，  
-  双 Decoder 的**掩删 / 掩插**互补机制是可实现的。  
-• Decoder-1 通过压缩正则真正学到“删繁就简”的归因能力；  
-  Decoder-2 继承了自回归 Pointer 视角的“由因生果”能力；  
-  Encoder-MLM 并行填词，保证整体生成质量与推理速度。  
-• 关键落点在于离散位置决策的稳定训练与插删数量一致性控制——  
-  解决这两点即可把方案做成一条具有解释性且高吞吐的 LLM 生产线。
+1. 用一个可学习 **Gate** 在“删除-插-补”完整链条和“直接插-补”之间切换，即把 **编辑** 与 **生成** 统一起来。  
+2. 训练时把 L 轮全部展开即可端到端反传；StopCriterion 让推理时动态早停。  
+3. 损失中增加「调用编辑的代价」即可让 Gate 自主权衡；用户仍可强制 override。  
+
+这样 DualMaskLM 既能像 Grammarly 那样局部润色，又能像 GPT 那样自由写作，而且仍保持并行生成的低延迟优势。
